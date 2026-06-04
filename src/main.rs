@@ -344,11 +344,14 @@ mod windows_service_impl {
 
     fn run_service() -> Result<(), Box<dyn std::error::Error>> {
         let (tx, rx) = oneshot::channel();
+        let mut tx = Some(tx);
 
         let event_handler = move |control_event| -> ServiceControlHandlerResult {
             match control_event {
                 ServiceControl::Stop => {
-                    let _ = tx.send(());
+                    if let Some(sender) = tx.take() {
+                        let _ = sender.send(());
+                    }
                     ServiceControlHandlerResult::NoError
                 }
                 ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
@@ -400,17 +403,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     #[cfg(windows)]
     {
-        match windows_service_impl::run() {
-            Ok(_) => return Ok(()),
-            Err(e) => {
-                let is_not_service = match &e {
-                    windows_service::Error::Winapi(io_err) => io_err.raw_os_error() == Some(1063),
-                    _ => false,
-                };
-                if !is_not_service {
-                    return Err(e);
+        if let Err(e) = windows_service_impl::run() {
+            let mut is_not_service = false;
+            if let Some(win_err) = e.downcast_ref::<windows_service::Error>() {
+                if let windows_service::Error::Winapi(io_err) = win_err {
+                    if io_err.raw_os_error() == Some(1063) {
+                        is_not_service = true;
+                    }
                 }
             }
+
+            if !is_not_service {
+                return Err(e);
+            }
+        } else {
+            return Ok(());
         }
     }
 
