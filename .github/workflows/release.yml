@@ -28,7 +28,7 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@latest
+        uses: actions/checkout@v6
 
       - name: Install dependencies (Linux)
         if: matrix.os == 'ubuntu-latest'
@@ -37,12 +37,10 @@ jobs:
           sudo apt-get install -y libssl-dev pkg-config
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@latest
-        with:
-          toolchain: stable
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Cache dependencies
-        uses: Swatinem/rust-cache@latest
+        uses: Swatinem/rust-cache@v2
 
       - name: Build
         run: cargo build --release
@@ -57,7 +55,7 @@ jobs:
           fi
 
       - name: Create Release
-        uses: softprops/action-gh-release@latest
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ github.ref_name == 'main' && 'latest' || github.ref_name }}
           files: ${{ matrix.asset_name }}
