@@ -48,17 +48,57 @@ cargo build --release
 ./target/release/PostgREST
 ```
 
-The server listens on `127.0.0.1:3000`:
+The server listens on `127.0.0.1:3000` by default.
 
-```
-PostgREST listening on 127.0.0.1:3000
-```
+### CLI Arguments
 
-For development:
+| Argument | Short | Description |
+| :--- | :--- | :--- |
+| `--daemon` | `-d` | Install and start the application as a background service. |
+| `--disable` | | Stop and uninstall the background service. |
+| `--help` | `-h` | Print help information. |
+| `--version` | `-V` | Print version information. |
 
+---
+
+## Service Management
+
+PostgREST can be registered as a native background service on both Linux and Windows. This ensures it starts automatically after a reboot and runs without an open terminal.
+
+### Linux (systemd)
+The `--daemon` flag creates a systemd unit at `/etc/systemd/system/postgrest-server.service`, enables it, and starts it.
 ```bash
-cargo run
+sudo ./target/release/PostgREST --daemon
 ```
+
+To check the status:
+```bash
+systemctl status postgrest-server
+```
+
+To remove the service:
+```bash
+sudo ./target/release/PostgREST --disable
+```
+
+### Windows (Service Control Manager)
+The `--daemon` flag registers a service named `postgrest-server` in the Windows Service Control Manager.
+```powershell
+# Run terminal as Administrator
+.\target\release\PostgREST.exe --daemon
+```
+
+To check the status (PowerShell):
+```powershell
+Get-Service postgrest-server
+```
+
+To remove the service:
+```powershell
+.\target\release\PostgREST.exe --disable
+```
+
+*Note: Administrative/Root privileges are required to modify system services.*
 
 ---
 
@@ -204,6 +244,7 @@ Postgres values are converted to JSON by column type:
 .
 ├── Cargo.toml
 ├── src/
-│   └── main.rs      # the entire service
+│   ├── main.rs      # entry point and server logic
+│   └── cli.rs       # CLI parsing and service management
 └── .secrets/        # your local PEMs + pw.txt (gitignored)
 ```

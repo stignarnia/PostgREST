@@ -17,6 +17,8 @@ use serde_json::{Value, json};
 use std::{net::SocketAddr, sync::Arc};
 use tokio_postgres::Client;
 
+mod cli;
+
 #[derive(Clone, Eq, PartialEq, Hash)]
 struct ConnectionKey {
     host: String,
@@ -141,8 +143,6 @@ async fn get_or_create_client(
         cache.invalidate(&key).await;
     }
 
-    // get_with handles concurrency: if multiple requests for the same key
-    // arrive at once, only one open_connection will run.
     cache
         .try_get_with(key.clone(), async {
             open_connection(req).await.map(Arc::new)
@@ -151,25 +151,14 @@ async fn get_or_create_client(
         .map_err(|e| format!("Failed to connect: {}", e).into())
 }
 
-/// Default `sslmode` when the request omits it — matches libpq's default.
 const DEFAULT_SSLMODE: &str = "prefer";
 
-/// Resolved TLS behavior for one of the six libpq sslmode levels.
 struct SslPolicy {
-    /// Wire-level negotiation passed to tokio-postgres (`disable`/`prefer`/`require`).
     pg_sslmode: &'static str,
-    /// Whether the server certificate chain is verified.
     verify_peer: bool,
-    /// Whether the server hostname must match the certificate (verify-full only).
     verify_hostname: bool,
 }
 
-/// Maps a libpq sslmode string onto what tokio-postgres + OpenSSL must do.
-///
-/// tokio-postgres only negotiates three wire modes, so `verify-ca`/`verify-full`
-/// ride on top of `require` and add certificate/hostname checks in OpenSSL.
-/// `allow` has no exact tokio-postgres equivalent (it prefers *plaintext* and
-/// only upgrades if the server demands TLS); we approximate it with `prefer`.
 fn ssl_policy(sslmode: &str) -> SslPolicy {
     match sslmode {
         "disable" => SslPolicy {
@@ -217,8 +206,6 @@ async fn open_connection(
     let sslmode = req.sslmode.as_deref().unwrap_or(DEFAULT_SSLMODE);
     let policy = ssl_policy(sslmode);
 
-    // Build the connection via the Config builder so values with spaces or
-    // special characters (e.g. passwords) don't need keyword/value escaping.
     let mut config = tokio_postgres::Config::new();
     config
         .host(req.host.trim())
@@ -254,8 +241,6 @@ fn build_tls_connector(
 
     if policy.verify_peer {
         builder.set_verify(SslVerifyMode::PEER);
-        // Trust anchor for verify-ca / verify-full. Added on top of the system
-        // roots that SslConnector::builder loads by default.
         if let Some(ref pem) = req.sslrootcert {
             let cert = X509::from_pem(pem.as_bytes())?;
             builder.cert_store_mut().add_cert(cert)?;
@@ -264,7 +249,6 @@ fn build_tls_connector(
         builder.set_verify(SslVerifyMode::NONE);
     }
 
-    // Client certificate / key (mTLS) — sent whenever the caller provides them.
     if let Some(ref cert_pem) = req.sslcert {
         let cert = X509::from_pem(cert_pem.as_bytes())?;
         builder.set_certificate(&cert)?;
@@ -275,9 +259,6 @@ fn build_tls_connector(
     }
 
     let mut connector = MakeTlsConnector::new(builder.build());
-    // OpenSSL's `into_ssl` enables hostname checking by default; that is only
-    // what verify-full wants. Toggle it explicitly so verify-ca checks the CA
-    // chain but ignores the hostname.
     let verify_hostname = policy.verify_hostname;
     connector.set_callback(move |config, _domain| {
         config.set_verify_hostname(verify_hostname);
@@ -318,8 +299,7 @@ fn pg_value_to_json(row: &tokio_postgres::Row, idx: usize) -> Value {
     }
 }
 
-#[tokio::main]
-async fn main() {
+pub async fn run_server() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let state = AppState {
         clients: Cache::builder().max_capacity(100).build(),
     };
@@ -330,6 +310,119 @@ async fn main() {
 
     let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
     println!("PostgREST listening on {}", addr);
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+#[cfg(windows)]
+mod windows_service_impl {
+    use std::time::Duration;
+    use tokio::sync::oneshot;
+    use windows_service::{
+        define_windows_service,
+        service::{
+            ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus,
+            ServiceType,
+        },
+        service_control_handler::{self, ServiceControlHandlerResult},
+        service_dispatcher,
+    };
+
+    define_windows_service!(ffi_service_main, windows_service_main);
+
+    pub fn run() -> Result<(), Box<dyn std::error::Error>> {
+        service_dispatcher::start("postgrest-server", ffi_service_main)?;
+        Ok(())
+    }
+
+    fn windows_service_main(_arguments: Vec<std::ffi::OsString>) {
+        if let Err(_e) = run_service() {
+            // Log error
+        }
+    }
+
+    fn run_service() -> Result<(), Box<dyn std::error::Error>> {
+        let (tx, rx) = oneshot::channel();
+
+        let event_handler = move |control_event| -> ServiceControlHandlerResult {
+            match control_event {
+                ServiceControl::Stop => {
+                    let _ = tx.send(());
+                    ServiceControlHandlerResult::NoError
+                }
+                ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
+                _ => ServiceControlHandlerResult::NotImplemented,
+            }
+        };
+
+        let status_handle = service_control_handler::register("postgrest-server", event_handler)?;
+
+        status_handle.set_service_status(ServiceStatus {
+            service_type: ServiceType::OWN_PROCESS,
+            current_state: ServiceState::Running,
+            controls_accepted: ServiceControlAccept::STOP,
+            exit_code: ServiceExitCode::Win32(0),
+            checkpoint: 0,
+            wait_hint: Duration::default(),
+            process_id: None,
+        })?;
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?;
+
+        rt.block_on(async {
+            tokio::select! {
+                _ = crate::run_server() => {},
+                _ = rx => {},
+            }
+        });
+
+        status_handle.set_service_status(ServiceStatus {
+            service_type: ServiceType::OWN_PROCESS,
+            current_state: ServiceState::Stopped,
+            controls_accepted: ServiceControlAccept::empty(),
+            exit_code: ServiceExitCode::Win32(0),
+            checkpoint: 0,
+            wait_hint: Duration::default(),
+            process_id: None,
+        })?;
+
+        Ok(())
+    }
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if cli::handle_cli()? {
+        return Ok(());
+    }
+
+    #[cfg(windows)]
+    {
+        match windows_service_impl::run() {
+            Ok(_) => return Ok(()),
+            Err(e) => {
+                let is_not_service = match &e {
+                    windows_service::Error::Winapi(io_err) => io_err.raw_os_error() == Some(1063),
+                    _ => false,
+                };
+                if !is_not_service {
+                    return Err(e);
+                }
+            }
+        }
+    }
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+
+    rt.block_on(async {
+        if let Err(e) = run_server().await {
+            eprintln!("Server error: {}", e);
+        }
+    });
+
+    Ok(())
 }
