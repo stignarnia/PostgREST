@@ -1,0 +1,63 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        include:
+          - os: ubuntu-latest
+            asset_name: PostgREST-linux-amd64
+          - os: windows-latest
+            asset_name: PostgREST-windows-amd64.exe
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev pkg-config
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Prepare assets
+        shell: bash
+        run: |
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            mv target/release/PostgREST.exe ${{ matrix.asset_name }}
+          else
+            mv target/release/PostgREST ${{ matrix.asset_name }}
+          fi
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name == 'main' && 'latest' || github.ref_name }}
+          files: ${{ matrix.asset_name }}
+          prerelease: ${{ github.ref_name == 'main' }}
+          name: ${{ github.ref_name == 'main' && 'Latest Build' || github.ref_name }}
+          generate_release_notes: true
+          body: |
+            Automated release for ${{ github.ref_name }}
+            Commit: ${{ github.sha }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
