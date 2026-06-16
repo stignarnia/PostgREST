@@ -5,6 +5,7 @@ use axum::{
     response::IntoResponse,
     routing::post,
 };
+use proxy::{ProxyState, handle_proxy};
 use moka::future::Cache;
 use openssl::{
     pkey::PKey,
@@ -18,6 +19,7 @@ use std::{net::SocketAddr, sync::Arc};
 use tokio_postgres::Client;
 
 mod cli;
+mod proxy;
 
 #[derive(Clone, Eq, PartialEq, Hash)]
 struct ConnectionKey {
@@ -304,9 +306,13 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error + Send + Sync>
         clients: Cache::builder().max_capacity(100).build(),
     };
 
+    let proxy_state = ProxyState::new();
+
     let app = Router::new()
         .route("/query", post(handle_query))
-        .with_state(state);
+        .with_state(state)
+        .route("/proxy", post(handle_proxy))
+        .with_state(proxy_state);
 
     let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
     println!("PostgREST listening on {}", addr);

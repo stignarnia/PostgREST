@@ -53,6 +53,7 @@ fn install_service() -> Result<(), Box<dyn std::error::Error>> {
         working_directory: None,
         environment: None,
         autostart: true,
+        restart_policy: Default::default(),
     })?;
 
     manager.start(ServiceStartCtx { label })?;
