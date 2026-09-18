@@ -1,3 +1,4 @@
+use crate::health;
 use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use reqwest::{
@@ -11,6 +12,31 @@ use serde_json::json;
 use std::{collections::HashMap, str::FromStr, sync::Arc};
 
 const MAX_REDIRECTS: usize = 10;
+
+#[derive(Debug)]
+struct TooManyRedirects;
+
+impl std::fmt::Display for TooManyRedirects {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "too many redirects (>{MAX_REDIRECTS})")
+    }
+}
+
+impl std::error::Error for TooManyRedirects {}
+
+// A fixed label for /health; the message itself can carry the URL.
+fn error_kind(e: &(dyn std::error::Error + Send + Sync + 'static)) -> &'static str {
+    if e.is::<TooManyRedirects>() {
+        return "too_many_redirects";
+    }
+    match e.downcast_ref::<reqwest::Error>() {
+        Some(r) if r.is_timeout() => "timeout",
+        Some(r) if r.is_connect() => "connect",
+        Some(r) if r.is_body() || r.is_decode() => "body",
+        Some(_) => "request",
+        None => "invalid_request",
+    }
+}
 
 #[derive(Clone)]
 pub struct ProxyState {
@@ -61,13 +87,19 @@ pub async fn handle_proxy(
     State(state): State<ProxyState>,
     Json(req): Json<ProxyRequest>,
 ) -> impl IntoResponse {
+    let host = Url::parse(&req.url)
+        .ok()
+        .and_then(|u| u.host_str().map(String::from));
     match forward(state, req).await {
         Ok(resp) => (StatusCode::OK, Json(json!(resp))).into_response(),
-        Err(e) => (
-            StatusCode::BAD_GATEWAY,
-            Json(json!({ "error": e.to_string() })),
-        )
-            .into_response(),
+        Err(e) => {
+            health::record("proxy", error_kind(e.as_ref()), host, None);
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({ "error": e.to_string() })),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -163,5 +195,5 @@ async fn forward(
         url = next;
     }
 
-    Err(format!("too many redirects (>{MAX_REDIRECTS})").into())
+    Err(TooManyRedirects.into())
 }

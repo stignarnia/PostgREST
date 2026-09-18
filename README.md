@@ -39,6 +39,8 @@ including the three mTLS PEMs and the `sslmode`, in the request itself.
 - **JSON output** — rows returned as a JSON array, like PostgREST.
 - **Parameterized queries** — optional `$1, $2, …` placeholders with a `params` array.
 - **HTTP forwarding** — `POST /proxy` follows redirects like a browser, with a per-request cookie jar, and returns the final URL and every cookie.
+- **Health** — `GET /health` reports the running version, uptime, updater state and the last 50 failures.
+- **Self-updating** — the service installs newer GitHub releases by itself and restarts on them.
 
 ---
 
@@ -65,6 +67,8 @@ The server listens on `127.0.0.1:3000` by default.
 | :--- | :--- | :--- |
 | `--daemon` | `-d` | Install and start the application as a background service. |
 | `--disable` | | Stop and uninstall the background service. |
+| `--update` | | Install the latest release now and restart the service. Run it with the executable the service runs. |
+| `--no-update` | | Run without the automatic updater. Passed on to the service when combined with `--daemon`. |
 | `--help` | `-h` | Print help information. |
 | `--version` | `-V` | Print version information. |
 
@@ -108,6 +112,36 @@ To remove the service:
 ```
 
 *Note: Administrative/Root privileges are required to modify system services.*
+
+On Windows, `--daemon` also runs `sc failure postgrest-server reset= 86400
+actions= restart/5000/restart/5000/restart/5000`: `sc create` sets no restart
+policy, and the updater needs one. A service installed by v1.0.8 or earlier
+lacks it — run `--disable` then `--daemon` once (or that `sc failure` command)
+before relying on automatic updates. The systemd unit already has
+`Restart=on-failure`.
+
+---
+
+## Automatic updates
+
+While the server runs, it checks
+`https://api.github.com/repos/stignarnia/PostgREST/releases/latest` one minute
+after start and every 6 hours after that. Pre-releases are ignored.
+
+- A release is installed only if its `vX.Y.Z` tag is **strictly newer** than
+  the running version — never a downgrade.
+- The asset for the platform (`PostgREST-linux-amd64` /
+  `PostgREST-windows-amd64.exe`) is downloaded, and rejected unless its size
+  equals the asset's published size and it starts with the platform's
+  executable header (ELF / `MZ`). The download is trusted on HTTPS from GitHub
+  plus those checks; releases carry no signature.
+- It replaces the running executable in place (`self-replace`, which also
+  handles Windows' locked `.exe`), then the process exits with status 1 so the
+  service manager starts the new binary. Requests in flight at that moment are
+  dropped.
+
+Pushing a `v*` tag therefore deploys it to every host within 6 hours. Use
+`--no-update` to opt a host out, and `--update` to install immediately.
 
 ---
 
@@ -197,6 +231,34 @@ Redirects are followed by hand, up to 10 hops, with browser semantics:
 This is what lets a multi-step form or OIDC login run through the proxy: the
 session and antiforgery cookies survive every hop, and an authorization code
 delivered on the last redirect arrives in `url`.
+
+### `GET /health`
+
+```json
+{
+  "version": "1.0.9",
+  "uptime_secs": 51234,
+  "updater": {
+    "enabled": true,
+    "last_check": 1789736887,
+    "latest_release": "v1.0.9",
+    "last_error": null
+  },
+  "errors": [
+    { "at": 1789736887, "source": "proxy", "kind": "connect", "host": "example.com", "code": null }
+  ]
+}
+```
+
+- Always `200` while the process is up; the body says whether anything fails.
+  Times are Unix seconds.
+- `errors` holds the last 50 failures of `query`, `proxy` and `updater`, in
+  memory only. Each entry is a fixed `kind` label plus, where it applies, the
+  target `host` and the Postgres SQLSTATE `code` — never an error message,
+  which could echo request data. The caller already gets the full error in its
+  own response.
+- `updater.last_error` is one of the updater's fixed labels (e.g.
+  `download size mismatch`).
 
 ---
 
@@ -291,6 +353,14 @@ Postgres values are converted to JSON by column type:
 
 - **Nothing touches disk.** Certificates and keys are parsed directly from the
   request bytes in memory. No temp files, no logging of secrets.
+- **Nothing request-derived is ever printed.** Under systemd, stdout and
+  stderr go to the journal, which is written to disk. So every line the
+  process prints is a fixed string or a value that cannot carry request data:
+  version numbers, the listen address, an `io::ErrorKind`, a fixed label, or a
+  source location — a panic hook replaces the default one, which would print
+  the panic message. No logger is installed, so dependencies' `log`/`tracing`
+  output is dropped. Request-related detail lives only in `/health`'s in-memory
+  list, as described above.
 - **The proxy keeps nothing between requests.** Its cookie jar exists for one
   `/proxy` call and is dropped with it; request and response bodies, headers
   and cookies are never logged. The service unit is installed with no
@@ -318,6 +388,8 @@ Postgres values are converted to JSON by column type:
 ├── src/
 │   ├── main.rs      # entry point, server and /query
 │   ├── proxy.rs     # /proxy HTTP forwarder
+│   ├── health.rs    # /health and the in-memory failure list
+│   ├── updater.rs   # automatic and --update self-update
 │   └── cli.rs       # CLI parsing and service management
 └── .secrets/        # your local PEMs + pw.txt (gitignored)
 ```

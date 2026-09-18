@@ -1,0 +1,4 @@
+# Vendored OpenSSL's MSVC objects reference an ossl_static.pdb that is never
+# copied next to them; LNK4099 only says their debug info is skipped.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "link-arg=/ignore:4099"]

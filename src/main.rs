@@ -3,7 +3,7 @@ use axum::{
     extract::{Json, State},
     http::StatusCode,
     response::IntoResponse,
-    routing::post,
+    routing::{get, post},
 };
 use proxy::{ProxyState, handle_proxy};
 use moka::future::Cache;
@@ -19,7 +19,25 @@ use std::{net::SocketAddr, sync::Arc};
 use tokio_postgres::Client;
 
 mod cli;
+mod health;
 mod proxy;
+mod updater;
+
+/// Marks a failure to open the connection, as opposed to running the query.
+#[derive(Debug)]
+struct ConnectError(Box<dyn std::error::Error + Send + Sync>);
+
+impl std::fmt::Display for ConnectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl std::error::Error for ConnectError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.0.source()
+    }
+}
 
 #[derive(Clone, Eq, PartialEq, Hash)]
 struct ConnectionKey {
@@ -79,9 +97,17 @@ async fn handle_query(
     State(state): State<AppState>,
     Json(req): Json<QueryRequest>,
 ) -> impl IntoResponse {
+    let host = req.host.trim().to_string();
     match run_query(state, req).await {
         Ok(rows) => (StatusCode::OK, Json(json!({ "rows": rows }))).into_response(),
         Err(e) => {
+            let kind = if e.is::<ConnectError>() { "connect" } else { "query" };
+            let code = e
+                .downcast_ref::<tokio_postgres::Error>()
+                .and_then(|pg| pg.code())
+                .map(|c| c.code().to_string());
+            health::record("query", kind, Some(host), code);
+
             let mut msg = e.to_string();
             let mut src = e.source();
             while let Some(s) = src {
@@ -97,7 +123,9 @@ async fn run_query(
     state: AppState,
     req: QueryRequest,
 ) -> Result<Vec<Value>, Box<dyn std::error::Error + Send + Sync>> {
-    let client = get_or_create_client(&state.clients, &req).await?;
+    let client = get_or_create_client(&state.clients, &req)
+        .await
+        .map_err(|e| Box::new(ConnectError(e)) as Box<dyn std::error::Error + Send + Sync>)?;
 
     let rows = if let Some(params) = &req.params {
         let string_params: Vec<String> = params
@@ -226,9 +254,18 @@ async fn open_connection(
     let tls = build_tls_connector(&policy, req)?;
     let (client, connection) = config.connect(tls).await?;
 
+    // The driver's message can quote what the server sent, so it goes nowhere:
+    // stderr is persisted by journald.
+    let host = req.host.trim().to_string();
     tokio::spawn(async move {
         if let Err(e) = connection.await {
-            eprintln!("connection dropped: {}", e);
+            eprintln!("connection dropped");
+            health::record(
+                "query",
+                "connection_dropped",
+                Some(host),
+                e.code().map(|c| c.code().to_string()),
+            );
         }
     });
 
@@ -308,11 +345,15 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error + Send + Sync>
 
     let proxy_state = ProxyState::new();
 
+    health::init();
+    tokio::spawn(updater::run());
+
     let app = Router::new()
         .route("/query", post(handle_query))
         .with_state(state)
         .route("/proxy", post(handle_proxy))
-        .with_state(proxy_state);
+        .with_state(proxy_state)
+        .route("/health", get(health::handle_health));
 
     let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
     println!("PostgREST listening on {}", addr);
@@ -403,6 +444,13 @@ mod windows_service_impl {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // The default hook prints the panic message, which could hold request data;
+    // stderr is persisted by journald, so only the location is printed.
+    std::panic::set_hook(Box::new(|info| match info.location() {
+        Some(l) => eprintln!("PostgREST panicked at {}:{}:{}", l.file(), l.line(), l.column()),
+        None => eprintln!("PostgREST panicked"),
+    }));
+
     if cli::handle_cli()? {
         return Ok(());
     }
@@ -433,7 +481,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     rt.block_on(async {
         if let Err(e) = run_server().await {
-            eprintln!("Server error: {}", e);
+            match e.downcast_ref::<std::io::Error>() {
+                Some(io) => eprintln!("Server error: {:?}", io.kind()),
+                None => eprintln!("Server error"),
+            }
         }
     });
 
