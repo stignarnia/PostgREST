@@ -14,6 +14,11 @@ different credentials.
 Connections are kept alive in RAM and reused across requests — one persistent
 connection per unique credential set, similar in spirit to Cloudflare Hyperdrive.
 
+It also exposes `POST /proxy`, a generic HTTP forwarder: callers that reach this
+host (e.g. through a tunnel) can make outbound HTTP requests from its network
+and egress IP. The same rule applies — every credential travels in the request,
+nothing is stored.
+
 ---
 
 ## Why
@@ -33,13 +38,17 @@ including the three mTLS PEMs and the `sslmode`, in the request itself.
 - **Multi-tenant** — different callers with different credentials hold independent live connections at the same time.
 - **JSON output** — rows returned as a JSON array, like PostgREST.
 - **Parameterized queries** — optional `$1, $2, …` placeholders with a `params` array.
+- **HTTP forwarding** — `POST /proxy` follows redirects like a browser, with a per-request cookie jar, and returns the final URL and every cookie.
 
 ---
 
 ## Requirements
 
-- Rust (edition 2024 — toolchain 1.85+; tested on 1.96).
-- OpenSSL development libraries (provided by the `openssl` crate's system linkage).
+- Rust (edition 2024 — toolchain 1.85+; tested on 1.98).
+- A C toolchain, `perl` and `make`: the `openssl` crate is built with the
+  `vendored` feature, which compiles OpenSSL from source instead of linking the
+  system library, and `reqwest`'s rustls backend (`aws-lc-rs`) compiles C code
+  too. No system OpenSSL is needed.
 
 ## Build & Run
 
@@ -134,6 +143,61 @@ Request body (JSON):
 { "error": "full error chain message" }
 ```
 
+### `POST /proxy`
+
+Forwards one HTTP request and returns the response. Request body (JSON):
+
+| Field     | Type   | Required | Description                                                      |
+|-----------|--------|----------|------------------------------------------------------------------|
+| `url`     | string | yes      | Absolute URL to request.                                         |
+| `method`  | string | no       | HTTP method (default `GET`).                                     |
+| `headers` | object | no       | Header name → value. A `Cookie` header seeds the cookie jar.     |
+| `body`    | string | no       | Request body, sent as is.                                        |
+
+**Success** → `200 OK`, whatever status the upstream returned:
+
+```json
+{
+  "status": 200,
+  "headers": { "content-type": "text/html" },
+  "body": "<base64 of the response body>",
+  "url": "https://final.host/after/redirects?code=…",
+  "cookie": "a=1; b=2"
+}
+```
+
+- `status`, `headers`, `body` describe the **final** response.
+- `headers` holds one value per name; a header sent several times (notably
+  `Set-Cookie`) keeps only the last. Read cookies from `cookie` instead.
+- `url` is where the redirect chain ended.
+- `cookie` is every cookie the jar holds for `url`, formatted as a `Cookie`
+  header value (`null` if none) — send it back as `headers.Cookie` on the next
+  call to carry a session across calls.
+
+**Error** (invalid method/URL/header, network failure, more than 10 redirects)
+→ `502 Bad Gateway`:
+
+```json
+{ "error": "message" }
+```
+
+#### Redirects and cookies
+
+Redirects are followed by hand, up to 10 hops, with browser semantics:
+
+- `307`/`308` replay the method and body; `301`/`302` turn a `POST` into a
+  `GET`, and `303` turns anything but `HEAD` into one, dropping the body and its
+  `Content-Type`.
+- Every hop stores its `Set-Cookie` headers in a cookie jar that lives for this
+  request only, and sends the jar's cookies for its own URL (domain and path
+  scoped). The caller's `Cookie` header is loaded into the jar for `url`.
+- `Authorization` / `Proxy-Authorization` are dropped when a redirect crosses
+  to another origin.
+
+This is what lets a multi-step form or OIDC login run through the proxy: the
+session and antiforgery cookies survive every hop, and an authorization code
+delivered on the last redirect arrives in `url`.
+
 ---
 
 ## SSL Mode Implementation
@@ -227,12 +291,20 @@ Postgres values are converted to JSON by column type:
 
 - **Nothing touches disk.** Certificates and keys are parsed directly from the
   request bytes in memory. No temp files, no logging of secrets.
+- **The proxy keeps nothing between requests.** Its cookie jar exists for one
+  `/proxy` call and is dropped with it; request and response bodies, headers
+  and cookies are never logged. The service unit is installed with no
+  arguments or environment, so no credential is written to it either.
 - **Memory Swapping**: The one OS-level caveat is memory pressure: data in RAM
   could in theory be swapped to disk. Use `mlock` or encrypted swap if that is
   in your threat model.
 - This service runs **arbitrary SQL** supplied by the caller with the caller's
   own credentials. Put it behind your own authentication/authorization and
   network controls.
+- `/proxy` is an **open forwarder**: anyone who can reach the port can make
+  requests to any URL from this host's network and IP, including internal
+  addresses. It listens on `127.0.0.1` only; expose it solely through a trusted
+  tunnel.
 - Always run it over a trusted transport (TLS terminator / private network);
   the request body carries live credentials and private keys.
 
@@ -244,7 +316,8 @@ Postgres values are converted to JSON by column type:
 .
 ├── Cargo.toml
 ├── src/
-│   ├── main.rs      # entry point and server logic
+│   ├── main.rs      # entry point, server and /query
+│   ├── proxy.rs     # /proxy HTTP forwarder
 │   └── cli.rs       # CLI parsing and service management
 └── .secrets/        # your local PEMs + pw.txt (gitignored)
 ```

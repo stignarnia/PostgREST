@@ -2,8 +2,6 @@ name: Release
 
 on:
   push:
-    branches:
-      - main
     tags:
       - "v*"
 
@@ -30,12 +28,6 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v6
 
-      - name: Install dependencies (Linux)
-        if: matrix.os == 'ubuntu-latest'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libssl-dev pkg-config
-
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
 
@@ -57,10 +49,9 @@ jobs:
       - name: Create Release
         uses: softprops/action-gh-release@v3
         with:
-          tag_name: ${{ github.ref_name == 'main' && 'latest' || github.ref_name }}
+          tag_name: ${{ github.ref_name }}
           files: ${{ matrix.asset_name }}
-          prerelease: ${{ github.ref_name == 'main' }}
-          name: ${{ github.ref_name == 'main' && 'Latest Build' || github.ref_name }}
+          name: ${{ github.ref_name }}
           generate_release_notes: true
           body: |
             Automated release for ${{ github.ref_name }}
