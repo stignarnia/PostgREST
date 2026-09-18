@@ -1,6 +1,6 @@
 [package]
 name = "PostgREST"
-version = "1.0.7"
+version = "1.0.8"
 edition = "2024"
 
 [dependencies]
@@ -14,8 +14,8 @@ postgres-openssl = "0.5"
 openssl = { version = "0.10", features = ["vendored"] }
 clap = { version = "4", features = ["derive"] }
 service-manager = "0.11"
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "gzip", "brotli", "deflate"] }
-base64 = "0.22"
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "gzip", "brotli", "deflate", "cookies"] }
+base64 = "0.23"
 
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.8"
